@@ -321,10 +321,10 @@ export default function HomePage() {
  					<table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
  						<thead>
  							<tr style={{ background: "#f9fafb", textAlign: "left" }}>
- 								<th style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb" }}>#</th>
- 								<th style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb" }}>Name</th>
- 								<th style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb" }}>Device</th>
- 								<th style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb" }}>Time</th>
+ 								<th style={{ padding: "10px 12px", borderBottom: "1px solid rgb(32, 32, 32)" }}>#</th>
+ 								<th style={{ padding: "10px 12px", borderBottom: "1px solid rgb(32, 32, 32)" }}>Name</th>
+ 								<th style={{ padding: "10px 12px", borderBottom: "1px solid rgb(32, 32, 32)" }}>Device</th>
+ 								<th style={{ padding: "10px 12px", borderBottom: "1px solid rgb(32, 32, 32)" }}>Time</th>
  							</tr>
  						</thead>
  						<tbody>
