@@ -85,9 +85,34 @@ export default function HomePage() {
 
 			setScanError(null);
 			setInfoMessage(null);
-			addEntry(result);
+
+			let parsed: { name?: string; deviceId?: string } | null = null;
+			try {
+				parsed = JSON.parse(result);
+			} catch {
+				// fallback: treat as plain name if not JSON
+				parsed = { name: result };
+			}
+			const incomingName = (parsed && parsed.name ? parsed.name : "").trim();
+			const incomingDeviceId = (parsed && parsed.deviceId ? parsed.deviceId : "").trim();
+
+			if (!incomingName) {
+				setScanError("QR does not contain a valid name.");
+				return;
+			}
+
+			// Enforce one entry per device if deviceId present
+			if (incomingDeviceId) {
+				const already = entries.some((e) => e.deviceId === incomingDeviceId);
+				if (already) {
+					setScanError("This device has already checked in.");
+					return;
+				}
+			}
+
+			addEntry(incomingName);
 		},
-		[addEntry, justScanned]
+		[addEntry, entries, justScanned]
 	);
 
 	const handleManualAdd = useCallback(() => {
@@ -126,14 +151,16 @@ export default function HomePage() {
  	}, [entries]);
 
 	const clearAll = useCallback(() => {
- 		setEntries([]);
- 		localStorage.removeItem(ATTENDANCE_STORAGE_KEY);
- 		localStorage.removeItem(DEVICE_ID_STORAGE_KEY);
- 		setManualName("");
- 		setScanError(null);
- 		setInfoMessage(null);
- 		writeAttendance([]);
- 	}, []);
+		setEntries([]);
+		localStorage.removeItem(ATTENDANCE_STORAGE_KEY);
+		localStorage.removeItem(DEVICE_ID_STORAGE_KEY);
+		// Regenerate a fresh device ID and update the ref
+		deviceIdRef.current = getOrCreateDeviceId();
+		setManualName("");
+		setScanError(null);
+		setInfoMessage(null);
+		writeAttendance([]);
+	}, []);
 
 	const sortedEntries = useMemo(
  		() => [...entries].sort((a, b) => b.timestamp.localeCompare(a.timestamp)),
