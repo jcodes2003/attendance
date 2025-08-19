@@ -123,10 +123,10 @@ export default function StudentPage() {
 					<div style={{ width: 240, height: 240, display: "grid", placeItems: "center", color: "#6b7280" }}>Enter a name to preview</div>
 				)}
 			</div>
-
+{/* 
 			<div style={{ marginTop: 16 }}>
 				<a href="/" style={{ color: "#2563eb" }}>Go to Scanner</a>
-			</div>
+			</div> */}
 		</div>
 	);
 }
