@@ -6,278 +6,382 @@ import * as XLSX from "xlsx";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 
-type AttendanceEntry = {
-	name: string;
-	deviceId: string;
-	timestamp: string; // ISO string
+type ScannedItem = {
+    deviceId: string;
+    rawData: string;
+    name: string | null;
+    metadata: Record<string, unknown> | null;
+    scannedAt: number; // epoch ms
 };
 
-const ATTENDANCE_STORAGE_KEY = "attendance:list";
-const DEVICE_ID_STORAGE_KEY = "attendance:deviceId";
+const LOCAL_STORAGE_KEY = "qratt:scans";
 
-function getOrCreateDeviceId(): string {
-	if (typeof window === "undefined") return "";
-	let deviceId = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
-	if (!deviceId) {
-		try {
-			deviceId = crypto.randomUUID();
-		} catch {
-			deviceId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-		}
-		localStorage.setItem(DEVICE_ID_STORAGE_KEY, deviceId);
-	}
-	return deviceId;
-}
-
-function readAttendance(): AttendanceEntry[] {
-	if (typeof window === "undefined") return [];
-	try {
-		const raw = localStorage.getItem(ATTENDANCE_STORAGE_KEY);
-		return raw ? (JSON.parse(raw) as AttendanceEntry[]) : [];
-	} catch {
-		return [];
-	}
-}
-
-function writeAttendance(entries: AttendanceEntry[]) {
-	if (typeof window === "undefined") return;
-	localStorage.setItem(ATTENDANCE_STORAGE_KEY, JSON.stringify(entries));
+function parseDeviceIdFromQrPayload(payload: string): {
+    deviceId: string;
+    name: string | null;
+    metadata: Record<string, unknown> | null;
+} {
+    const trimmed = payload.trim();
+    try {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        // Attempt to extract a human-friendly name
+        const nameCandidateKeys = [
+            "name",
+            "fullName",
+            "studentName",
+            "student_name",
+            "ownerName",
+            "owner",
+            "userName",
+            "username",
+            "firstName",
+            "lastName",
+        ];
+        let extractedName: string | null = null;
+        for (const key of nameCandidateKeys) {
+            if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+                const value = (parsed as any)[key];
+                if (typeof value === "string" && value.trim()) {
+                    extractedName = value.trim();
+                    break;
+                }
+            }
+        }
+        // Combine firstName + lastName if available
+        if (!extractedName) {
+            const first = (parsed as any)["firstName"];
+            const last = (parsed as any)["lastName"];
+            if (typeof first === "string" && typeof last === "string") {
+                const combo = `${first} ${last}`.trim();
+                if (combo) extractedName = combo;
+            }
+        }
+        const candidateKeys = [
+            "deviceId",
+            "deviceID",
+            "device_id",
+            "id",
+            "device",
+        ];
+        for (const key of candidateKeys) {
+            if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+                const value = (parsed as any)[key];
+                if (typeof value === "string" && value.trim().length > 0) {
+                    return { deviceId: value.trim(), name: extractedName, metadata: parsed };
+                }
+                if (value && typeof value === "object" && (value as any).id) {
+                    const nested = String((value as any).id).trim();
+                    if (nested.length > 0) {
+                        return { deviceId: nested, name: extractedName, metadata: parsed };
+                    }
+                }
+            }
+        }
+        // Fallback: search any string field that looks like an id
+        for (const [key, value] of Object.entries(parsed)) {
+            if (typeof value === "string" && /id/i.test(key) && value.trim()) {
+                return { deviceId: value.trim(), name: extractedName, metadata: parsed };
+            }
+        }
+        // As a last resort, treat full JSON string as the id
+        return { deviceId: trimmed, name: extractedName, metadata: parsed };
+    } catch {
+        // Not JSON; treat full string as the id
+        return { deviceId: trimmed, name: null, metadata: null };
+    }
 }
 
 export default function HomePage() {
-	const [entries, setEntries] = useState<AttendanceEntry[]>([]);
-	const [manualName, setManualName] = useState("");
-	const [scanError, setScanError] = useState<string | null>(null);
-	const [infoMessage, setInfoMessage] = useState<string | null>(null);
-	const [justScanned, setJustScanned] = useState(false);
-	const deviceIdRef = useRef<string>("");
+    const [scannedItems, setScannedItems] = useState<ScannedItem[]>([]);
+    const [isScanning, setIsScanning] = useState<boolean>(true);
+    const [statusMessage, setStatusMessage] = useState<string>(
+        "Align a QR code within the frame"
+    );
+    const lastRawRef = useRef<string>("");
+    const lastTimeRef = useRef<number>(0);
 
-	useEffect(() => {
-		deviceIdRef.current = getOrCreateDeviceId();
-		setEntries(readAttendance());
-	}, []);
+    // Load existing scans from localStorage on mount
+    useEffect(() => {
+        try {
+            const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+            if (raw) {
+                const parsed = JSON.parse(raw) as ScannedItem[];
+                if (Array.isArray(parsed)) {
+                    setScannedItems(parsed);
+                }
+            }
+        } catch {
+            // ignore malformed storage
+        }
+    }, []);
 
-	const addEntry = useCallback((nameRaw: string) => {
-		const name = nameRaw.trim();
-		if (!name) return;
- 
- 		// Prevent duplicates by name (case-insensitive)
- 		const exists = entries.some(
- 			(e) => e.name.localeCompare(name, undefined, { sensitivity: "accent" }) === 0
- 		);
- 		if (exists) return;
- 
- 		const newEntry: AttendanceEntry = {
- 			name,
- 			deviceId: deviceIdRef.current,
- 			timestamp: new Date().toISOString(),
- 		};
- 		const updated = [newEntry, ...entries];
- 		setEntries(updated);
- 		writeAttendance(updated);
- 	}, [entries]);
+    // Persist on change
+    useEffect(() => {
+        try {
+            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(scannedItems));
+        } catch {
+            // ignore quota errors
+        }
+    }, [scannedItems]);
 
-	const handleDecode = useCallback(
-		(result: string) => {
-			if (justScanned) return; // debounce burst scans
-			setJustScanned(true);
-			setTimeout(() => setJustScanned(false), 1200);
+    const deviceIdSet = useMemo(() => {
+        return new Set(scannedItems.map((item) => item.deviceId));
+    }, [scannedItems]);
 
-			setScanError(null);
-			setInfoMessage(null);
+    const handleDecoded = useCallback(
+        (decodedText: string) => {
+            const now = Date.now();
+            // Debounce identical results fired rapidly by the scanner
+            if (
+                lastRawRef.current === decodedText &&
+                now - lastTimeRef.current < 1500
+            ) {
+                return;
+            }
+            lastRawRef.current = decodedText;
+            lastTimeRef.current = now;
 
-			let parsed: { name?: string; deviceId?: string } | null = null;
-			try {
-				parsed = JSON.parse(result);
-			} catch {
-				// fallback: treat as plain name if not JSON
-				parsed = { name: result };
-			}
-			const incomingName = (parsed && parsed.name ? parsed.name : "").trim();
-			const incomingDeviceId = (parsed && parsed.deviceId ? parsed.deviceId : "").trim();
+            const { deviceId, name, metadata } = parseDeviceIdFromQrPayload(decodedText);
+            if (!deviceId) {
+                setStatusMessage("No device id found in QR");
+                return;
+            }
+            if (deviceIdSet.has(deviceId)) {
+                setStatusMessage(`Duplicate ignored: ${deviceId}`);
+                return;
+            }
 
-			if (!incomingName) {
-				setScanError("QR does not contain a valid name.");
-				return;
-			}
+            const newItem: ScannedItem = {
+                deviceId,
+                rawData: decodedText,
+                name: name ?? null,
 
-			// Enforce one entry per device if deviceId present
-			if (incomingDeviceId) {
-				const already = entries.some((e) => e.deviceId === incomingDeviceId);
-				if (already) {
-					setScanError("This device has already checked in.");
-					return;
-				}
-			}
+                metadata,
+                scannedAt: now,
+            };
+            setScannedItems((prev) => [newItem, ...prev]);
+            setStatusMessage(`Saved: ${deviceId}`);
+        },
+        [deviceIdSet]
+    );
 
-			addEntry(incomingName);
-		},
-		[addEntry, entries, justScanned]
-	);
+    const handleError = useCallback((error: unknown) => {
+        setStatusMessage(
+            error instanceof Error ? error.message : "Camera error while scanning"
+        );
+    }, []);
 
-	const handleManualAdd = useCallback(() => {
-		if (!manualName.trim()) return;
-		addEntry(manualName);
-		setManualName("");
-	}, [addEntry, manualName]);
+    const removeItem = useCallback((deviceId: string) => {
+        setScannedItems((prev) => prev.filter((i) => i.deviceId !== deviceId));
+    }, []);
 
-	const exportExcel = useCallback(() => {
- 		const worksheet = XLSX.utils.json_to_sheet(
- 			entries.map((e) => ({
- 				Name: e.name,
- 				Device: e.deviceId,
- 				Time: new Date(e.timestamp).toLocaleString(),
- 			}))
- 		);
- 		const workbook = XLSX.utils.book_new();
- 		XLSX.utils.book_append_sheet(workbook, worksheet, "Attendance");
- 		XLSX.writeFile(workbook, "attendance.xlsx");
- 	}, [entries]);
+    const clearAll = useCallback(() => {
+        setScannedItems([]);
+        setStatusMessage("All scans cleared");
+    }, []);
 
-	const exportPdf = useCallback(() => {
- 		const doc = new jsPDF();
- 		doc.text("Attendance", 14, 16);
- 		autoTable(doc, {
- 			head: [["#", "Name", "Device", "Time"]],
- 			body: entries.map((e, idx) => [
- 				String(idx + 1),
- 				e.name,
- 				e.deviceId,
- 				new Date(e.timestamp).toLocaleString(),
- 			]),
- 			startY: 22,
- 		});
- 		doc.save("attendance.pdf");
- 	}, [entries]);
+    const exportToExcel = useCallback(() => {
+        const rows = scannedItems
+            .slice()
+            .reverse()
+            .map((item) => ({
+                "Device ID": item.deviceId,
+                "Scanned At": new Date(item.scannedAt).toLocaleString(),
+                "Name": item.name ?? "",
+            }));
+        const worksheet = XLSX.utils.json_to_sheet(rows);
+        const workbook = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(workbook, worksheet, "Scans");
+        XLSX.writeFile(workbook, "scans.xlsx");
+    }, [scannedItems]);
 
-	const clearAll = useCallback(() => {
-		setEntries([]);
-		localStorage.removeItem(ATTENDANCE_STORAGE_KEY);
-		localStorage.removeItem(DEVICE_ID_STORAGE_KEY);
-		// Regenerate a fresh device ID and update the ref
-		deviceIdRef.current = getOrCreateDeviceId();
-		setManualName("");
-		setScanError(null);
-		setInfoMessage(null);
-		writeAttendance([]);
-	}, []);
+    const exportToPdf = useCallback(() => {
+        const doc = new jsPDF();
+        const rows = scannedItems
+            .slice()
+            .reverse()
+            .map((item) => [
+                item.deviceId,
+                new Date(item.scannedAt).toLocaleString(),
+                item.name ?? "",
+            ]);
+        autoTable(doc, {
+            head: [["Device ID", "Scanned At", "Name"]],
+            body: rows,
+            styles: { fontSize: 8 },
+            headStyles: { fillColor: [40, 40, 40] },
+            startY: 14,
+            margin: { left: 10, right: 10 },
+        });
+        doc.text("QR Scans", 10, 10);
+        doc.save("scans.pdf");
+    }, [scannedItems]);
 
-	const sortedEntries = useMemo(
- 		() => [...entries].sort((a, b) => b.timestamp.localeCompare(a.timestamp)),
- 		[entries]
- 	);
+    return (
+        <main style={{ maxWidth: 920, margin: "0 auto", padding: 16 }}>
+            <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>
+                QR Scanner & Export
+            </h1>
+            <p style={{ color: "#555", marginBottom: 16 }}>{statusMessage}</p>
 
-	return (
- 		<div style={{ maxWidth: 920, margin: "0 auto", padding: "24px" }}>
- 			<h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>QR Attendance</h1>
- 			<p style={{ color: "#555", marginBottom: 16 }}>
- 				Organizer scans attendance and saves it here. Students can generate their QR at <a href="/student" style={{ color: "#2563eb" }}>/student</a>.
- 			</p>
+            <div
+                style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr",
+                    gap: 16,
+                    marginBottom: 16,
+                }}
+            >
+                <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 12 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <button
+                            onClick={() => setIsScanning((s) => !s)}
+                            style={{
+                                padding: "8px 12px",
+                                background: isScanning ? "#ef4444" : "#10b981",
+                                color: "white",
+                                border: 0,
+                                borderRadius: 6,
+                                cursor: "pointer",
+                            }}
+                        >
+                            {isScanning ? "Stop Scanner" : "Start Scanner"}
+                        </button>
 
- 			<div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12, padding: 12, border: "1px solid #e5e7eb", borderRadius: 12 }}>
- 				<span style={{ fontWeight: 600 }}>Organizer lock:</span>
- 				<span style={{ color: "#059669" }}>Unlocked</span>
- 			</div>
+                        <button
+                            onClick={clearAll}
+                            style={{
+                                padding: "8px 12px",
+                                background: "#6b7280",
+                                color: "white",
+                                border: 0,
+                                borderRadius: 6,
+                                cursor: "pointer",
+                            }}
+                        >
+                            Clear All
+                        </button>
 
- 			<div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
- 				<div style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 }}>
- 					<h3 style={{ margin: 0, marginBottom: 8, fontSize: 18 }}>Scan QR</h3>
- 					<div style={{ overflow: "hidden", borderRadius: 8 }}>
- 						<Scanner
- 							onScan={(codes) => {
- 								const value = Array.isArray(codes) && codes.length > 0 ? codes[0].rawValue : "";
- 								if (value) handleDecode(value);
- 							}}
- 							onError={(err: unknown) => {
- 								const message = err instanceof Error ? err.message : typeof err === "string" ? err : "Camera error";
- 								setScanError(String(message));
- 							}}
- 							constraints={{ facingMode: "environment" }}
- 							styles={{
- 								container: { width: "100%" },
- 								video: { width: "100%", borderRadius: 8 },
- 							}}
- 						/>
- 					</div>
- 					{scanError && (
- 						<div style={{ color: "#b91c1c", marginTop: 8 }}>{scanError}</div>
- 					)}
- 					{infoMessage && (
- 						<div style={{ color: "#059669", marginTop: 8 }}>{infoMessage}</div>
- 					)}
- 				</div>
+                        <div style={{ flex: 1 }} />
 
- 				<div style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 }}>
- 					<h3 style={{ margin: 0, marginBottom: 8, fontSize: 18 }}>Manual entry</h3>
- 					<div style={{ display: "flex", gap: 8 }}>
- 						<input
- 							type="text"
- 							placeholder="Full name"
- 							value={manualName}
- 							onChange={(e) => setManualName(e.target.value)}
- 							style={{ flex: 1, padding: "10px 12px", border: "1px solid #d1d5db", borderRadius: 8 }}
- 						/>
- 						<button
- 							onClick={handleManualAdd}
- 							style={{
- 								padding: "10px 14px",
- 								background: "#111827",
- 								color: "white",
- 								border: 0,
- 								borderRadius: 8,
- 								cursor: "pointer",
- 							}}
- 						>
- 							Add
- 						</button>
- 					</div>
- 				</div>
- 			</div>
+                        <button
+                            onClick={exportToExcel}
+                            style={{
+                                padding: "8px 12px",
+                                background: "#2563eb",
+                                color: "white",
+                                border: 0,
+                                borderRadius: 6,
+                                cursor: "pointer",
+                            }}
+                        >
+                            Export Excel
+                        </button>
+                        <button
+                            onClick={exportToPdf}
+                            style={{
+                                padding: "8px 12px",
+                                background: "#111827",
+                                color: "white",
+                                border: 0,
+                                borderRadius: 6,
+                                cursor: "pointer",
+                            }}
+                        >
+                            Export PDF
+                        </button>
+                    </div>
 
- 			<div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
- 				<button onClick={exportExcel} style={{ padding: "10px 14px", background: "#2563eb", color: "white", border: 0, borderRadius: 8, cursor: "pointer" }}>
- 					Export Excel
- 				</button>
- 				<button onClick={exportPdf} style={{ padding: "10px 14px", background: "#059669", color: "white", border: 0, borderRadius: 8, cursor: "pointer" }}>
- 					Export PDF
- 				</button>
- 				<button onClick={clearAll} style={{ padding: "10px 14px", background: "#ef4444", color: "white", border: 0, borderRadius: 8, cursor: "pointer" }}>
- 					Clear List
- 				</button>
- 			</div>
+                    {isScanning && (
+                        <div style={{ marginTop: 12 }}>
+                            <Scanner
+                                onScan={(detected) => {
+                                    const first = Array.isArray(detected) ? detected[0] : undefined;
+                                    const text = first?.rawValue || "";
+                                    if (text) handleDecoded(text);
+                                }}
+                                onError={handleError}
+                                constraints={{ facingMode: "environment" }}
+                            />
+                        </div>
+                    )}
+                </div>
 
- 			<div style={{ marginTop: 20 }}>
- 				<h3 style={{ margin: 0, marginBottom: 8, fontSize: 18 }}>Attendance ({sortedEntries.length})</h3>
- 				<div style={{ overflowX: "auto", border: "1px solid #e5e7eb", borderRadius: 12 }}>
- 					<table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
- 						<thead>
- 							<tr style={{ background: "#f9fafb", textAlign: "left" }}>
- 								<th style={{ padding: "10px 12px", borderBottom: "1px solid rgb(32, 32, 32)" }}>#</th>
- 								<th style={{ padding: "10px 12px", borderBottom: "1px solid rgb(32, 32, 32)" }}>Name</th>
- 								<th style={{ padding: "10px 12px", borderBottom: "1px solid rgb(32, 32, 32)" }}>Device</th>
- 								<th style={{ padding: "10px 12px", borderBottom: "1px solid rgb(32, 32, 32)" }}>Time</th>
- 							</tr>
- 						</thead>
- 						<tbody>
- 							{sortedEntries.map((e, idx) => (
- 								<tr key={`${e.name}-${e.timestamp}`}>
- 									<td style={{ padding: "10px 12px", borderBottom: "1px solid #f3f4f6", color: "#6b7280" }}>{idx + 1}</td>
- 									<td style={{ padding: "10px 12px", borderBottom: "1px solid #f3f4f6" }}>{e.name}</td>
- 									<td style={{ padding: "10px 12px", borderBottom: "1px solid #f3f4f6", fontFamily: "monospace" }}>{e.deviceId}</td>
- 									<td style={{ padding: "10px 12px", borderBottom: "1px solid #f3f4f6" }}>{new Date(e.timestamp).toLocaleString()}</td>
- 								</tr>
- 							))}
- 							{sortedEntries.length === 0 && (
- 								<tr>
- 									<td colSpan={4} style={{ padding: "12px", color: "#6b7280" }}>No entries yet.</td>
- 								</tr>
- 							)}
- 						</tbody>
- 					</table>
- 				</div>
- 			</div>
- 		</div>
- 	);
+                <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 12 }}>
+                    <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>
+                        Saved Scans ({scannedItems.length})
+                    </h2>
+                    {scannedItems.length === 0 ? (
+                        <p style={{ color: "#666" }}>No scans yet.</p>
+                    ) : (
+                        <div style={{ overflowX: "auto" }}>
+                            <table
+                                style={{
+                                    width: "100%",
+                                    borderCollapse: "collapse",
+                                    fontSize: 14,
+                                }}
+                            >
+                                <thead>
+                                    <tr>
+                                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>
+                                            #
+                                        </th>
+                                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>
+                                            Device ID
+                                        </th>
+                                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>
+                                            Scanned At
+                                        </th>
+                                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>
+                                            Name
+                                        </th>
+                                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>
+                                            Actions
+                                        </th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {scannedItems.map((item, index) => (
+                                        <tr key={item.deviceId}>
+                                            <td style={{ padding: 8, borderBottom: "1px solid #f3f4f6", color: "#6b7280" }}>
+                                                {scannedItems.length - index}
+                                            </td>
+                                            <td style={{ padding: 8, borderBottom: "1px solid #f3f4f6", fontWeight: 600 }}>
+                                                {item.deviceId}
+                                            </td>
+                                            <td style={{ padding: 8, borderBottom: "1px solid #f3f4f6" }}>
+                                                {item.name ?? ""}
+                                            </td>
+                                            <td style={{ padding: 8, borderBottom: "1px solid #f3f4f6" }}>
+                                                {new Date(item.scannedAt).toLocaleString()}
+                                            </td>
+
+                                            <td style={{ padding: 8, borderBottom: "1px solid #f3f4f6" }}>
+                                                <button
+                                                    onClick={() => removeItem(item.deviceId)}
+                                                    style={{
+                                                        padding: "6px 10px",
+                                                        background: "#ef4444",
+                                                        color: "white",
+                                                        border: 0,
+                                                        borderRadius: 6,
+                                                        cursor: "pointer",
+                                                    }}
+                                                >
+                                                    Remove
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                </div>
+            </div>
+        </main>
+    );
 }
 
 
