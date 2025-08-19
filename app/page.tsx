@@ -1,103 +1,290 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
-  return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Scanner } from "@yudiel/react-qr-scanner";
+import * as XLSX from "xlsx";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
-            />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
-        </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
-    </div>
-  );
+type AttendanceEntry = {
+	name: string;
+	deviceId: string;
+	timestamp: string; // ISO string
+};
+
+type Mode = "scanner" | "self";
+
+const ATTENDANCE_STORAGE_KEY = "attendance:list";
+const DEVICE_ID_STORAGE_KEY = "attendance:deviceId";
+const SELF_ATTEMPT_KEY = "attendance:self:attempted";
+
+function getOrCreateDeviceId(): string {
+	if (typeof window === "undefined") return "";
+	let deviceId = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+	if (!deviceId) {
+		try {
+			deviceId = crypto.randomUUID();
+		} catch {
+			deviceId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+		}
+		localStorage.setItem(DEVICE_ID_STORAGE_KEY, deviceId);
+	}
+	return deviceId;
 }
+
+function readAttendance(): AttendanceEntry[] {
+	if (typeof window === "undefined") return [];
+	try {
+		const raw = localStorage.getItem(ATTENDANCE_STORAGE_KEY);
+		return raw ? (JSON.parse(raw) as AttendanceEntry[]) : [];
+	} catch {
+		return [];
+	}
+}
+
+function writeAttendance(entries: AttendanceEntry[]) {
+	if (typeof window === "undefined") return;
+	localStorage.setItem(ATTENDANCE_STORAGE_KEY, JSON.stringify(entries));
+}
+
+export default function HomePage() {
+	const [mode, setMode] = useState<Mode>("scanner");
+	const [entries, setEntries] = useState<AttendanceEntry[]>([]);
+	const [manualName, setManualName] = useState("");
+	const [scanError, setScanError] = useState<string | null>(null);
+	const [justScanned, setJustScanned] = useState(false);
+	const [selfAttempted, setSelfAttempted] = useState(false);
+	const deviceIdRef = useRef<string>("");
+
+	useEffect(() => {
+		deviceIdRef.current = getOrCreateDeviceId();
+		setEntries(readAttendance());
+		setSelfAttempted(localStorage.getItem(SELF_ATTEMPT_KEY) === "true");
+	}, []);
+
+	const addEntry = useCallback((nameRaw: string) => {
+		const name = nameRaw.trim();
+		if (!name) return;
+ 
+ 		// Prevent duplicates by name (case-insensitive)
+ 		const exists = entries.some(
+ 			(e) => e.name.localeCompare(name, undefined, { sensitivity: "accent" }) === 0
+ 		);
+ 		if (exists) return;
+ 
+ 		const newEntry: AttendanceEntry = {
+ 			name,
+ 			deviceId: deviceIdRef.current,
+ 			timestamp: new Date().toISOString(),
+ 		};
+ 		const updated = [newEntry, ...entries];
+ 		setEntries(updated);
+ 		writeAttendance(updated);
+ 	}, [entries]);
+
+	const handleDecode = useCallback(
+ 		(result: string) => {
+ 			if (justScanned) return; // debounce burst scans
+ 			setJustScanned(true);
+ 			setTimeout(() => setJustScanned(false), 1200);
+ 
+ 			if (mode === "self") {
+ 				if (selfAttempted) return;
+ 				addEntry(result);
+ 				localStorage.setItem(SELF_ATTEMPT_KEY, "true");
+ 				setSelfAttempted(true);
+ 				return;
+ 			}
+ 
+ 			// scanner mode can add many
+ 			addEntry(result);
+ 		},
+ 		[addEntry, justScanned, mode, selfAttempted]
+ 	);
+
+	const handleManualAdd = useCallback(() => {
+ 		if (!manualName.trim()) return;
+ 		if (mode === "self" && selfAttempted) return;
+ 		addEntry(manualName);
+ 		setManualName("");
+ 		if (mode === "self") {
+ 			localStorage.setItem(SELF_ATTEMPT_KEY, "true");
+ 			setSelfAttempted(true);
+ 		}
+ 	}, [addEntry, manualName, mode, selfAttempted]);
+
+	const exportExcel = useCallback(() => {
+ 		const worksheet = XLSX.utils.json_to_sheet(
+ 			entries.map((e) => ({
+ 				Name: e.name,
+ 				Device: e.deviceId,
+ 				Time: new Date(e.timestamp).toLocaleString(),
+ 			}))
+ 		);
+ 		const workbook = XLSX.utils.book_new();
+ 		XLSX.utils.book_append_sheet(workbook, worksheet, "Attendance");
+ 		XLSX.writeFile(workbook, "attendance.xlsx");
+ 	}, [entries]);
+
+	const exportPdf = useCallback(() => {
+ 		const doc = new jsPDF();
+ 		doc.text("Attendance", 14, 16);
+ 		autoTable(doc, {
+ 			head: [["#", "Name", "Device", "Time"]],
+ 			body: entries.map((e, idx) => [
+ 				String(idx + 1),
+ 				e.name,
+ 				e.deviceId,
+ 				new Date(e.timestamp).toLocaleString(),
+ 			]),
+ 			startY: 22,
+ 		});
+ 		doc.save("attendance.pdf");
+ 	}, [entries]);
+
+	const clearAll = useCallback(() => {
+ 		setEntries([]);
+ 		writeAttendance([]);
+ 	}, []);
+
+	const sortedEntries = useMemo(
+ 		() => [...entries].sort((a, b) => b.timestamp.localeCompare(a.timestamp)),
+ 		[entries]
+ 	);
+
+	return (
+ 		<div style={{ maxWidth: 920, margin: "0 auto", padding: "24px" }}>
+ 			<h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>QR Attendance</h1>
+ 			<p style={{ color: "#555", marginBottom: 16 }}>
+				Save names in localStorage, limit one self check-in per device, export as Excel or PDF. Students can generate their QR at <a href="/student" style={{ color: "#2563eb" }}>/student</a>.
+			</p>
+
+ 			<div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+ 				<label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+ 					<input
+ 						type="radio"
+ 						name="mode"
+ 						value="scanner"
+ 						checked={mode === "scanner"}
+ 						onChange={() => setMode("scanner")}
+ 					/>
+ 					<span>Scanner mode (organizer)</span>
+ 				</label>
+ 				<label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+ 					<input
+ 						type="radio"
+ 						name="mode"
+ 						value="self"
+ 						checked={mode === "self"}
+ 						onChange={() => setMode("self")}
+ 					/>
+ 					<span>Self check-in (one attempt per device)</span>
+ 				</label>
+ 			</div>
+
+ 			{mode === "self" && selfAttempted && (
+ 				<div style={{ marginBottom: 12, color: "#2563eb" }}>
+ 					You have already submitted attendance from this device.
+ 				</div>
+ 			)}
+
+ 			<div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
+ 				<div style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 }}>
+ 					<h3 style={{ margin: 0, marginBottom: 8, fontSize: 18 }}>Scan QR</h3>
+ 					<div style={{ overflow: "hidden", borderRadius: 8 }}>
+ 						<Scanner
+							onScan={(codes) => {
+								const value = Array.isArray(codes) && codes.length > 0 ? codes[0].rawValue : "";
+								if (value) handleDecode(value);
+							}}
+							onError={(err: unknown) => {
+								const message = err instanceof Error ? err.message : typeof err === "string" ? err : "Camera error";
+								setScanError(String(message));
+							}}
+							constraints={{ facingMode: "environment" }}
+							styles={{
+								container: { width: "100%" },
+								video: { width: "100%", borderRadius: 8 },
+							}}
+						/>
+ 					</div>
+ 					{scanError && (
+ 						<div style={{ color: "#b91c1c", marginTop: 8 }}>{scanError}</div>
+ 					)}
+ 				</div>
+
+ 				<div style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12 }}>
+ 					<h3 style={{ margin: 0, marginBottom: 8, fontSize: 18 }}>Manual entry</h3>
+ 					<div style={{ display: "flex", gap: 8 }}>
+ 						<input
+ 							type="text"
+ 							placeholder="Full name"
+ 							value={manualName}
+ 							onChange={(e) => setManualName(e.target.value)}
+ 							style={{ flex: 1, padding: "10px 12px", border: "1px solid #d1d5db", borderRadius: 8 }}
+ 						/>
+ 						<button
+ 							onClick={handleManualAdd}
+ 							disabled={mode === "self" && selfAttempted}
+ 							style={{
+ 								padding: "10px 14px",
+ 								background: (mode === "self" && selfAttempted) ? "#9ca3af" : "#111827",
+ 								color: "white",
+ 								border: 0,
+ 								borderRadius: 8,
+ 								cursor: (mode === "self" && selfAttempted) ? "not-allowed" : "pointer",
+ 							}}
+ 						>
+ 							Add
+ 						</button>
+ 					</div>
+ 				</div>
+ 			</div>
+
+ 			<div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap" }}>
+ 				<button onClick={exportExcel} style={{ padding: "10px 14px", background: "#2563eb", color: "white", border: 0, borderRadius: 8, cursor: "pointer" }}>
+ 					Export Excel
+ 				</button>
+ 				<button onClick={exportPdf} style={{ padding: "10px 14px", background: "#059669", color: "white", border: 0, borderRadius: 8, cursor: "pointer" }}>
+ 					Export PDF
+ 				</button>
+ 				<button onClick={clearAll} style={{ padding: "10px 14px", background: "#ef4444", color: "white", border: 0, borderRadius: 8, cursor: "pointer" }}>
+ 					Clear List
+ 				</button>
+ 			</div>
+
+ 			<div style={{ marginTop: 20 }}>
+ 				<h3 style={{ margin: 0, marginBottom: 8, fontSize: 18 }}>Attendance ({sortedEntries.length})</h3>
+ 				<div style={{ overflowX: "auto", border: "1px solid #e5e7eb", borderRadius: 12 }}>
+ 					<table style={{ width: "100%", borderCollapse: "separate", borderSpacing: 0 }}>
+ 						<thead>
+ 							<tr style={{ background: "#f9fafb", textAlign: "left" }}>
+ 								<th style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb" }}>#</th>
+ 								<th style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb" }}>Name</th>
+ 								<th style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb" }}>Device</th>
+ 								<th style={{ padding: "10px 12px", borderBottom: "1px solid #e5e7eb" }}>Time</th>
+ 							</tr>
+ 						</thead>
+ 						<tbody>
+ 							{sortedEntries.map((e, idx) => (
+ 								<tr key={`${e.name}-${e.timestamp}`}>
+ 									<td style={{ padding: "10px 12px", borderBottom: "1px solid #f3f4f6", color: "#6b7280" }}>{idx + 1}</td>
+ 									<td style={{ padding: "10px 12px", borderBottom: "1px solid #f3f4f6" }}>{e.name}</td>
+ 									<td style={{ padding: "10px 12px", borderBottom: "1px solid #f3f4f6", fontFamily: "monospace" }}>{e.deviceId}</td>
+ 									<td style={{ padding: "10px 12px", borderBottom: "1px solid #f3f4f6" }}>{new Date(e.timestamp).toLocaleString()}</td>
+ 								</tr>
+ 							))}
+ 							{sortedEntries.length === 0 && (
+ 								<tr>
+ 									<td colSpan={4} style={{ padding: "12px", color: "#6b7280" }}>No entries yet.</td>
+ 								</tr>
+ 							)}
+ 						</tbody>
+ 					</table>
+ 				</div>
+ 			</div>
+ 		</div>
+ 	);
+}
+
+
